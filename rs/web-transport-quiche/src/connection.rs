@@ -239,7 +239,7 @@ impl Connection {
             // We have to check and strip the session ID from the datagram.
             let actual_id = VarInt::decode(&mut cursor).map_err(|_| SessionError::Unknown)?;
             if actual_id != session_id {
-                return Err(SessionError::Unknown.into());
+                return Err(SessionError::Unknown);
             }
         }
 
