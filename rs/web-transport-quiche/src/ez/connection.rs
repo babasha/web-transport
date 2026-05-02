@@ -122,8 +122,9 @@ pub struct Connection {
     accept_bi: flume::Receiver<(SendStream, RecvStream)>,
     accept_uni: flume::Receiver<RecvStream>,
 
-    // Datagram plumbing. All channels are unbounded; drops are observed via
-    // the `close` handle, not the channel errors.
+    // Datagram plumbing. Both channels are bounded to the capacity configured
+    // on the *Builder; drops on full are silent and consistent with the
+    // unreliable QUIC datagram contract.
     dgram_in: flume::Receiver<Bytes>,
     dgram_out: flume::Sender<Bytes>,
     dgram_max: Arc<AtomicUsize>,
@@ -218,13 +219,21 @@ impl Connection {
 
     /// Queue an application datagram for the driver to send.
     ///
-    /// Datagrams are unreliable. If quiche's outbound queue is full the driver
-    /// will either back off (buffering locally) or drop the datagram on hard
-    /// errors. This call itself only fails if the driver is already gone.
+    /// Datagrams are unreliable. If the outbound channel is full the datagram
+    /// is **dropped** (returning `Ok(())`) — backpressure surfaces as packet
+    /// loss, which matches the QUIC datagram contract. Returns
+    /// `Err(ConnectionError::Dropped)` only when the driver itself is gone.
     pub fn send_datagram(&self, data: Bytes) -> Result<(), ConnectionError> {
-        self.dgram_out
-            .send(data)
-            .map_err(|_| ConnectionError::Dropped)?;
+        match self.dgram_out.try_send(data) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(_)) => {
+                tracing::trace!("dropping outbound datagram: channel full");
+                return Ok(());
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                return Err(ConnectionError::Dropped);
+            }
+        }
 
         // Nudge the driver so it picks up the new datagram on the next poll.
         let waker = self.driver.lock().wake();

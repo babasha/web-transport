@@ -9,12 +9,18 @@ use crate::ez::DriverState;
 
 use super::{Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings};
 
+/// Default per-direction capacity of the datagram flume channels. Keeps the
+/// driver and application loosely coupled while bounding queue depth so a
+/// stalled consumer can't grow memory unboundedly.
+pub const DEFAULT_DATAGRAM_CAPACITY: usize = 1024;
+
 /// Construct a QUIC client using sane defaults.
 pub struct ClientBuilder<M: Metrics = DefaultMetrics> {
     settings: Settings,
     socket: Option<tokio::net::UdpSocket>,
     tls: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     metrics: M,
+    dgram_capacity: usize,
 }
 
 impl Default for ClientBuilder<DefaultMetrics> {
@@ -34,7 +40,18 @@ impl<M: Metrics> ClientBuilder<M> {
             metrics: m,
             socket: None,
             tls: None,
+            dgram_capacity: DEFAULT_DATAGRAM_CAPACITY,
         }
+    }
+
+    /// Override the per-direction capacity of the datagram channels.
+    ///
+    /// When either channel fills up subsequent datagrams are **dropped**
+    /// rather than queued, which matches the unreliable semantics of QUIC
+    /// datagrams. The default is [`DEFAULT_DATAGRAM_CAPACITY`].
+    pub fn with_datagram_capacity(mut self, capacity: usize) -> Self {
+        self.dgram_capacity = capacity.max(1);
+        self
     }
 
     /// Listen for incoming packets on the given socket.
@@ -57,6 +74,7 @@ impl<M: Metrics> ClientBuilder<M> {
             settings: self.settings,
             metrics: self.metrics,
             tls: self.tls,
+            dgram_capacity: self.dgram_capacity,
         })
     }
 
@@ -89,6 +107,7 @@ impl<M: Metrics> ClientBuilder<M> {
             settings: self.settings,
             metrics: self.metrics,
             socket: self.socket,
+            dgram_capacity: self.dgram_capacity,
         }
     }
 
@@ -161,8 +180,8 @@ impl<M: Metrics> ClientBuilder<M> {
 
         let accept_bi = flume::unbounded();
         let accept_uni = flume::unbounded();
-        let dgram_in = flume::unbounded();
-        let dgram_out = flume::unbounded();
+        let dgram_in = flume::bounded(self.dgram_capacity);
+        let dgram_out = flume::bounded(self.dgram_capacity);
         let dgram_max = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let driver = Lock::new(DriverState::new(false));

@@ -273,12 +273,15 @@ impl Connection {
 
     /// Computes the maximum size of datagrams that may be passed to
     /// [`send_datagram`](Self::send_datagram).
+    ///
+    /// Returns `0` when the peer did not negotiate the QUIC datagram extension
+    /// (or the value is otherwise unavailable) — in that case
+    /// [`send_datagram`](Self::send_datagram) will drop everything.
     pub fn max_datagram_size(&self) -> usize {
-        let mtu = self
-            .conn
-            .max_datagram_size()
-            .expect("datagram support is required");
-        mtu.saturating_sub(self.header_datagram.len())
+        match self.conn.max_datagram_size() {
+            Some(mtu) => mtu.saturating_sub(self.header_datagram.len()),
+            None => 0,
+        }
     }
 
     /// Immediately close the connection with an error code and reason.

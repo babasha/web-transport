@@ -129,3 +129,92 @@ async fn datagram_round_trip() -> Result<()> {
 
     Ok(())
 }
+
+/// Regression for kixelated's "shouldn't be unbounded, because there's no
+/// flow control" feedback. With a tiny capacity and a server that never reads,
+/// the outbound channel should saturate almost immediately and subsequent
+/// `send_datagram` calls must return promptly (drop-on-full), not block or
+/// accumulate. We assert the whole batch completes in well under a wall-clock
+/// budget that an unbounded queue would still meet — but pair it with a
+/// memory-style sanity check: the loop body itself must not await, so a
+/// blocking implementation would hang the single-threaded runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn datagram_send_drops_when_channel_full() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let (chain, key) = make_self_signed()?;
+
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut server = ServerBuilder::default()
+        .with_bind(bind)?
+        .with_settings(dgram_settings())
+        // Tiny: any backlog must be visible as drops.
+        .with_datagram_capacity(2)
+        .with_single_cert(chain, key)?;
+
+    let server_addr = *server
+        .local_addrs()
+        .first()
+        .context("server has no local address")?;
+
+    // Server: accept the session but never call read_datagram. The dgram_in
+    // channel on the server side will fill up; combined with an idle reader,
+    // the client's outbound queue will also see backpressure quickly.
+    let server_task = tokio::spawn(async move {
+        let request = server.accept().await.context("server accept")?;
+        let session = request.ok().await.context("server session")?;
+        // Hold the session open without consuming datagrams.
+        let _ = session.closed().await;
+        anyhow::Ok(())
+    });
+
+    let mut client_settings = dgram_settings();
+    client_settings.verify_peer = false;
+
+    let url = Url::parse(&format!("https://localhost:{}/", server_addr.port()))?;
+    let client = ClientBuilder::default()
+        .with_settings(client_settings)
+        .with_datagram_capacity(2)
+        .with_bind((Ipv4Addr::LOCALHOST, 0))?;
+
+    let session = client
+        .connect(url)
+        .await?
+        .established()
+        .await
+        .context("client handshake")?;
+
+    // Hammer the API with far more datagrams than fit in the channel.
+    // None of these should panic, block, or fail — drops are silent.
+    let payload = Bytes::from_static(b"x");
+    let start = std::time::Instant::now();
+    let attempts = 50_000;
+    for _ in 0..attempts {
+        session
+            .send_datagram(payload.clone())
+            .context("send_datagram surfaced an error on full channel")?;
+    }
+    let elapsed = start.elapsed();
+
+    // 50k synchronous calls should be far faster than 2 s even on a slow CI
+    // box. If we ever regress to a blocking send, this hangs and the test
+    // harness times out instead of producing a bad pass.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "send_datagram took {elapsed:?} for {attempts} calls — likely blocking"
+    );
+
+    session.close(0, "bye");
+    session.closed().await;
+
+    // Server task should drop out cleanly once the client closes.
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+    Ok(())
+}

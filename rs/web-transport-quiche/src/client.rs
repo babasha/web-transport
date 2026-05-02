@@ -74,6 +74,15 @@ impl<M: Metrics> ClientBuilder<M> {
         Self(self.0.with_settings(settings))
     }
 
+    /// Override the per-direction capacity of the datagram channels.
+    ///
+    /// When a channel fills up subsequent datagrams are dropped rather than
+    /// queued, matching the unreliable semantics of QUIC datagrams. Defaults
+    /// to [`ez::DEFAULT_DATAGRAM_CAPACITY`].
+    pub fn with_datagram_capacity(self, capacity: usize) -> Self {
+        Self(self.0.with_datagram_capacity(capacity))
+    }
+
     /// Optional: Use a client certificate for mTLS.
     pub fn with_single_cert(
         self,

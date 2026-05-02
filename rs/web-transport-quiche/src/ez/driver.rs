@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map, HashMap, HashSet, VecDeque},
+    collections::{hash_map, HashMap, HashSet},
     future::poll_fn,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -215,9 +215,9 @@ pub(super) struct Driver {
     // Datagrams.
     dgram_in: flume::Sender<Bytes>,
     dgram_out: flume::Receiver<Bytes>,
-    // Holds datagrams that quiche refused because its outbound queue was full.
-    dgram_pending: VecDeque<Bytes>,
-    // Published on every `process_writes`, read by the application side.
+    // Writable datagram size in bytes. Re-published every `process_writes`
+    // because PMTU discovery shrinks `max_send_udp_payload_size` mid-flight.
+    // 0 means the peer didn't negotiate the datagram extension.
     dgram_max: Arc<AtomicUsize>,
 }
 
@@ -239,7 +239,6 @@ impl Driver {
             accept_uni,
             dgram_in,
             dgram_out,
-            dgram_pending: VecDeque::new(),
             dgram_max,
         }
     }
@@ -251,6 +250,14 @@ impl Driver {
     ) -> Result<(), ConnectionError> {
         // Capture the negotiated ALPN protocol.
         let alpn = qconn.application_proto();
+
+        // Publish the initial writable MTU so callers that ask for
+        // `max_datagram_size` immediately after `established()` get a real
+        // number rather than 0. The value is refreshed in `process_writes`
+        // because PMTU discovery can shrink it later.
+        self.dgram_max
+            .store(qconn.dgram_max_writable_len().unwrap_or(0), Ordering::Relaxed);
+
         let wakers = {
             let mut state = self.state.lock();
             state.alpn = (!alpn.is_empty()).then(|| alpn.to_vec());
@@ -425,11 +432,16 @@ impl Driver {
             return Poll::Pending;
         }
 
-        let dgram_work = !self.dgram_out.is_empty() || !self.dgram_pending.is_empty();
-
         let (sleep, send, recv, bi_wakers, uni_wakers) = {
             let mut driver = self.state.lock();
+            // Park the waker before checking for work. `send_datagram` pushes
+            // to the channel first, then takes this waker — observing the
+            // queue after we publish the waker means any racing producer is
+            // guaranteed to either (a) see our waker and wake us, or (b) have
+            // already enqueued an item we will see here.
             driver.waker = Some(waker.clone());
+
+            let dgram_work = !self.dgram_out.is_empty();
 
             let sleep = driver.bi.create.is_empty()
                 && driver.uni.create.is_empty()
@@ -588,14 +600,20 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
         }
 
         // Drain any incoming datagrams into the application-side flume channel.
+        // The channel is bounded — if the application can't keep up we drop
+        // the new datagram (consistent with the unreliable contract).
         loop {
             match qconn.dgram_recv_vec() {
-                Ok(buf) => {
-                    if self.dgram_in.try_send(Bytes::from(buf)).is_err() {
+                Ok(buf) => match self.dgram_in.try_send(Bytes::from(buf)) {
+                    Ok(()) => {}
+                    Err(flume::TrySendError::Full(_)) => {
+                        tracing::trace!("dropping incoming datagram: channel full");
+                    }
+                    Err(flume::TrySendError::Disconnected(_)) => {
                         // Receiver dropped — connection gone or not interested.
                         break;
                     }
-                }
+                },
                 Err(quiche::Error::Done) => break,
                 Err(err) => {
                     tracing::trace!(?err, "ignoring datagram recv error");
@@ -613,36 +631,21 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
             return Ok(());
         }
 
-        // Publish the current writable MTU so the application can size frames.
-        self.dgram_max.store(
-            qconn.dgram_max_writable_len().unwrap_or(0),
-            Ordering::Relaxed,
-        );
+        // Refresh the writable MTU. Peer's max_datagram_frame_size is fixed at
+        // handshake, but `dgram_max_writable_len` also factors in
+        // max_send_udp_payload_size, which shrinks under PMTU discovery — so
+        // republishing per poll is the only correct thing to do.
+        self.dgram_max
+            .store(qconn.dgram_max_writable_len().unwrap_or(0), Ordering::Relaxed);
 
-        // Retry anything that didn't fit last time before accepting new datagrams.
-        while let Some(buf) = self.dgram_pending.front() {
-            match qconn.dgram_send(buf) {
-                Ok(()) => {
-                    self.dgram_pending.pop_front();
-                }
-                Err(quiche::Error::Done) => return Ok(()),
-                Err(err) => {
-                    tracing::trace!(?err, "dropping pending datagram");
-                    self.dgram_pending.pop_front();
-                }
-            }
-        }
-
-        // Drain freshly-queued datagrams from the application side.
+        // Datagrams are unreliable by spec — on any send failure (queue full,
+        // too large, peer didn't negotiate, etc.) we drop the datagram rather
+        // than buffer it and risk leaking memory under backpressure.
         while let Ok(buf) = self.dgram_out.try_recv() {
             match qconn.dgram_send(&buf) {
                 Ok(()) => {}
-                Err(quiche::Error::Done) => {
-                    self.dgram_pending.push_back(buf);
-                    return Ok(());
-                }
                 Err(err) => {
-                    tracing::trace!(?err, "dropping outbound datagram");
+                    tracing::trace!(?err, len = buf.len(), "dropping outbound datagram");
                 }
             }
         }
