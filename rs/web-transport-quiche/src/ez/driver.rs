@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::{
     collections::{hash_map, HashMap, HashSet},
     future::poll_fn,
@@ -7,7 +8,6 @@ use std::{
     },
     task::{Poll, Waker},
 };
-use bytes::Bytes;
 use tokio_quiche::{
     buf_factory::BufFactory,
     quic::{HandshakeInfo, QuicheConnection},
@@ -215,9 +215,8 @@ pub(super) struct Driver {
     // Datagrams.
     dgram_in: flume::Sender<Bytes>,
     dgram_out: flume::Receiver<Bytes>,
-    // Writable datagram size in bytes. Re-published every `process_writes`
-    // because PMTU discovery shrinks `max_send_udp_payload_size` mid-flight.
-    // 0 means the peer didn't negotiate the datagram extension.
+    // Writable datagram size in bytes, published once at handshake. 0 means the
+    // peer didn't negotiate the datagram extension.
     dgram_max: Arc<AtomicUsize>,
 }
 
@@ -251,12 +250,12 @@ impl Driver {
         // Capture the negotiated ALPN protocol.
         let alpn = qconn.application_proto();
 
-        // Publish the initial writable MTU so callers that ask for
-        // `max_datagram_size` immediately after `established()` get a real
-        // number rather than 0. The value is refreshed in `process_writes`
-        // because PMTU discovery can shrink it later.
-        self.dgram_max
-            .store(qconn.dgram_max_writable_len().unwrap_or(0), Ordering::Relaxed);
+        // Publish the writable MTU once the handshake completes. The negotiated
+        // value is fixed for the lifetime of the connection.
+        self.dgram_max.store(
+            qconn.dgram_max_writable_len().unwrap_or(0),
+            Ordering::Relaxed,
+        );
 
         let wakers = {
             let mut state = self.state.lock();
@@ -603,17 +602,20 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
         // The channel is bounded — if the application can't keep up we drop
         // the new datagram (consistent with the unreliable contract).
         loop {
-            match qconn.dgram_recv_vec() {
-                Ok(buf) => match self.dgram_in.try_send(Bytes::from(buf)) {
-                    Ok(()) => {}
-                    Err(flume::TrySendError::Full(_)) => {
-                        tracing::trace!("dropping incoming datagram: channel full");
+            match qconn.dgram_recv(&mut self.buf) {
+                Ok(len) => {
+                    let buf = Bytes::copy_from_slice(&self.buf[..len]);
+                    match self.dgram_in.try_send(buf) {
+                        Ok(()) => {}
+                        Err(flume::TrySendError::Full(_)) => {
+                            tracing::trace!("dropping incoming datagram: channel full");
+                        }
+                        Err(flume::TrySendError::Disconnected(_)) => {
+                            // Receiver dropped — connection gone or not interested.
+                            break;
+                        }
                     }
-                    Err(flume::TrySendError::Disconnected(_)) => {
-                        // Receiver dropped — connection gone or not interested.
-                        break;
-                    }
-                },
+                }
                 Err(quiche::Error::Done) => break,
                 Err(err) => {
                     tracing::trace!(?err, "ignoring datagram recv error");
@@ -630,13 +632,6 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
             self.abort(e);
             return Ok(());
         }
-
-        // Refresh the writable MTU. Peer's max_datagram_frame_size is fixed at
-        // handshake, but `dgram_max_writable_len` also factors in
-        // max_send_udp_payload_size, which shrinks under PMTU discovery — so
-        // republishing per poll is the only correct thing to do.
-        self.dgram_max
-            .store(qconn.dgram_max_writable_len().unwrap_or(0), Ordering::Relaxed);
 
         // Datagrams are unreliable by spec — on any send failure (queue full,
         // too large, peer didn't negotiate, etc.) we drop the datagram rather

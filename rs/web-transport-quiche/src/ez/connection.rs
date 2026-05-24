@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::sync::Arc;
 use std::{
     future::poll_fn,
@@ -8,7 +9,6 @@ use std::{
     },
     task::{Poll, Waker},
 };
-use bytes::Bytes;
 use thiserror::Error;
 use tokio_quiche::quiche;
 
@@ -122,9 +122,8 @@ pub struct Connection {
     accept_bi: flume::Receiver<(SendStream, RecvStream)>,
     accept_uni: flume::Receiver<RecvStream>,
 
-    // Datagram plumbing. Both channels are bounded to the capacity configured
-    // on the *Builder; drops on full are silent and consistent with the
-    // unreliable QUIC datagram contract.
+    // Datagram plumbing. Both channels are bounded; drops on full are silent
+    // and consistent with the unreliable QUIC datagram contract.
     dgram_in: flume::Receiver<Bytes>,
     dgram_out: flume::Sender<Bytes>,
     dgram_max: Arc<AtomicUsize>,

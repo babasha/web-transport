@@ -81,14 +81,6 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerInit> {
     pub fn with_settings(self, settings: ez::Settings) -> Self {
         Self(self.0.with_settings(settings))
     }
-
-    /// Override the per-connection datagram channel capacity.
-    ///
-    /// See [`ez::ClientBuilder::with_datagram_capacity`] for semantics. The
-    /// default is [`ez::DEFAULT_DATAGRAM_CAPACITY`].
-    pub fn with_datagram_capacity(self, capacity: usize) -> Self {
-        Self(self.0.with_datagram_capacity(capacity))
-    }
 }
 
 impl<M: ez::Metrics> ServerBuilder<M, ez::ServerWithListener> {
@@ -110,14 +102,6 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerWithListener> {
     /// Use the provided [Settings] instead of the defaults.
     pub fn with_settings(self, settings: ez::Settings) -> Self {
         Self(self.0.with_settings(settings))
-    }
-
-    /// Override the per-connection datagram channel capacity.
-    ///
-    /// See [`ez::ClientBuilder::with_datagram_capacity`] for semantics. The
-    /// default is [`ez::DEFAULT_DATAGRAM_CAPACITY`].
-    pub fn with_datagram_capacity(self, capacity: usize) -> Self {
-        Self(self.0.with_datagram_capacity(capacity))
     }
 
     /// Configure the server to use a static certificate for TLS.

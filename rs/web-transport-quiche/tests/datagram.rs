@@ -131,13 +131,11 @@ async fn datagram_round_trip() -> Result<()> {
 }
 
 /// Regression for kixelated's "shouldn't be unbounded, because there's no
-/// flow control" feedback. With a tiny capacity and a server that never reads,
-/// the outbound channel should saturate almost immediately and subsequent
-/// `send_datagram` calls must return promptly (drop-on-full), not block or
-/// accumulate. We assert the whole batch completes in well under a wall-clock
-/// budget that an unbounded queue would still meet — but pair it with a
-/// memory-style sanity check: the loop body itself must not await, so a
-/// blocking implementation would hang the single-threaded runtime.
+/// flow control" feedback. With a server that never reads, the outbound
+/// channel must saturate at its fixed capacity and subsequent `send_datagram`
+/// calls must return promptly (drop-on-full), not block or accumulate. We
+/// assert the whole batch completes in well under a wall-clock budget — a
+/// blocking implementation would hang the single-threaded runtime instead.
 #[tokio::test(flavor = "current_thread")]
 async fn datagram_send_drops_when_channel_full() -> Result<()> {
     let _ = tracing_subscriber::fmt()
@@ -154,8 +152,6 @@ async fn datagram_send_drops_when_channel_full() -> Result<()> {
     let mut server = ServerBuilder::default()
         .with_bind(bind)?
         .with_settings(dgram_settings())
-        // Tiny: any backlog must be visible as drops.
-        .with_datagram_capacity(2)
         .with_single_cert(chain, key)?;
 
     let server_addr = *server
@@ -180,7 +176,6 @@ async fn datagram_send_drops_when_channel_full() -> Result<()> {
     let url = Url::parse(&format!("https://localhost:{}/", server_addr.port()))?;
     let client = ClientBuilder::default()
         .with_settings(client_settings)
-        .with_datagram_capacity(2)
         .with_bind((Ipv4Addr::LOCALHOST, 0))?;
 
     let session = client
@@ -214,7 +209,11 @@ async fn datagram_send_drops_when_channel_full() -> Result<()> {
     session.closed().await;
 
     // Server task should drop out cleanly once the client closes.
-    let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+    tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .context("server task timed out")?
+        .context("server task panicked")?
+        .context("server task errored")?;
 
     Ok(())
 }

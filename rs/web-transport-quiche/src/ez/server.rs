@@ -13,9 +13,9 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use crate::ez::tls::{DynamicCertHook, StaticCertHook};
 use crate::ez::DriverState;
 
+use super::client::DGRAM_CHANNEL_CAPACITY;
 use super::{
     CertResolver, Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings,
-    DEFAULT_DATAGRAM_CAPACITY,
 };
 
 /// Used with [ServerBuilder] to require specific parameters.
@@ -34,7 +34,6 @@ pub struct ServerBuilder<M: Metrics = DefaultMetrics, S = ServerInit> {
     metrics: M,
     state: S,
     alpn: Vec<Vec<u8>>,
-    dgram_capacity: usize,
 }
 
 impl Default for ServerBuilder<DefaultMetrics> {
@@ -53,7 +52,6 @@ impl ServerBuilder<DefaultMetrics, ServerInit> {
             metrics: m,
             state: ServerInit {},
             alpn: Vec::new(),
-            dgram_capacity: DEFAULT_DATAGRAM_CAPACITY,
         }
     }
 }
@@ -65,7 +63,6 @@ impl<M: Metrics> ServerBuilder<M, ServerInit> {
             metrics: self.metrics,
             state: ServerWithListener { listeners: vec![] },
             alpn: self.alpn,
-            dgram_capacity: self.dgram_capacity,
         }
     }
 
@@ -93,15 +90,6 @@ impl<M: Metrics> ServerBuilder<M, ServerInit> {
     /// Use the provided [Settings] instead of the defaults.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
-        self
-    }
-
-    /// Override the per-connection datagram channel capacity.
-    ///
-    /// See [`ClientBuilder::with_datagram_capacity`] for semantics. The default
-    /// is [`DEFAULT_DATAGRAM_CAPACITY`].
-    pub fn with_datagram_capacity(mut self, capacity: usize) -> Self {
-        self.dgram_capacity = capacity.max(1);
         self
     }
 }
@@ -143,15 +131,6 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
     /// Use the provided [Settings] instead of the defaults.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
-        self
-    }
-
-    /// Override the per-connection datagram channel capacity.
-    ///
-    /// See [`ClientBuilder::with_datagram_capacity`] for semantics. The default
-    /// is [`DEFAULT_DATAGRAM_CAPACITY`].
-    pub fn with_datagram_capacity(mut self, capacity: usize) -> Self {
-        self.dgram_capacity = capacity.max(1);
         self
     }
 
@@ -201,7 +180,7 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
         let params = tokio_quiche::ConnectionParams::new_server(self.settings, dummy_tls, hooks);
         let server =
             tokio_quiche::listen_with_capabilities(self.state.listeners, params, self.metrics)?;
-        Ok(Server::new(server, local_addrs, self.dgram_capacity))
+        Ok(Server::new(server, local_addrs))
     }
 }
 
@@ -271,7 +250,6 @@ impl<M: Metrics> Server<M> {
     fn new(
         sockets: Vec<tokio_quiche::QuicConnectionStream<M>>,
         local_addrs: Vec<SocketAddr>,
-        dgram_capacity: usize,
     ) -> Self {
         let mut tasks = JoinSet::default();
 
@@ -280,7 +258,7 @@ impl<M: Metrics> Server<M> {
         for socket in sockets {
             let accept = accept.0.clone();
             // TODO close all when one errors
-            tasks.spawn(Self::run_socket(socket, accept, dgram_capacity));
+            tasks.spawn(Self::run_socket(socket, accept));
         }
 
         Self {
@@ -294,7 +272,6 @@ impl<M: Metrics> Server<M> {
     async fn run_socket(
         socket: tokio_quiche::QuicConnectionStream<M>,
         accept: mpsc::Sender<Incoming>,
-        dgram_capacity: usize,
     ) -> io::Result<()> {
         let mut rx = socket.into_inner();
         while let Some(initial) = rx.recv().await {
@@ -308,8 +285,8 @@ impl<M: Metrics> Server<M> {
 
             let accept_bi = flume::unbounded();
             let accept_uni = flume::unbounded();
-            let dgram_in = flume::bounded(dgram_capacity);
-            let dgram_out = flume::bounded(dgram_capacity);
+            let dgram_in = flume::bounded(DGRAM_CHANNEL_CAPACITY);
+            let dgram_out = flume::bounded(DGRAM_CHANNEL_CAPACITY);
             let dgram_max = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let state = Lock::new(DriverState::new(true));
