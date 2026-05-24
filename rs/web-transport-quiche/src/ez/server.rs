@@ -126,7 +126,7 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
 
         let listener = QuicListener {
             socket,
-            socket_cookie: self.state.listeners.len() as _,
+            cid_generator: Arc::new(SimpleConnectionIdGenerator),
             capabilities,
         };
 
@@ -199,12 +199,8 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
             .collect();
 
         let params = tokio_quiche::ConnectionParams::new_server(self.settings, dummy_tls, hooks);
-        let server = tokio_quiche::listen_with_capabilities(
-            self.state.listeners,
-            params,
-            SimpleConnectionIdGenerator,
-            self.metrics,
-        )?;
+        let server =
+            tokio_quiche::listen_with_capabilities(self.state.listeners, params, self.metrics)?;
         Ok(Server::new(server, local_addrs, self.dgram_capacity))
     }
 }
